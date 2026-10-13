@@ -99,6 +99,52 @@ curl -s -X PATCH $B/teams/$TEAM/notes/<note_id> -H "$AUTH" -H 'If-Match: "1"' \
 
 **Layering.** `models.py` (shapes) → `main.py` (HTTP and access rules) → `repo.py` (SQL) → `db.py` (connection and schema). Each layer is small enough to read in one sitting.
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -v
+```
+
+Fifteen end-to-end tests drive the real app over HTTP (FastAPI `TestClient`). Each test gets a fresh SQLite file, so tests are isolated and can run in any order. GitHub Actions runs the suite on every push (`.github/workflows/tests.yml`).
+
+The tests are organized around the rules a shared service must not break:
+
+| Area | Test | What it proves |
+|---|---|---|
+| Ops | `test_health` | The service is up and can reach its database |
+| Auth | `test_requires_auth` | No token or a bad token gets `401` |
+| Auth | `test_duplicate_email_rejected` | Emails are unique, case-insensitively (`409`) |
+| Core flow | `test_create_get_and_list_note` | Create, read, and list work; tags are normalized; `ETag` is returned |
+| Isolation | `test_outsider_cannot_see_team` | Non-members get `404` for reads and writes, so a team's existence never leaks |
+| Roles | `test_viewer_is_read_only` | Viewers can't create notes (`403`) |
+| Roles | `test_only_owner_manages_members` | Only owners can add members or change roles |
+| Privacy | `test_private_notes_are_author_only` | Private notes are hidden from teammates, in both reads and lists |
+| Privacy | `test_only_author_can_make_note_private` | Nobody can hide a teammate's note |
+| Concurrency | `test_update_requires_current_version` | Missing `If-Match` → `428`; a stale version → `412`; the newer edit survives |
+| Search | `test_search_and_tag_filter` | Full-text and tag filters return the right notes; FTS syntax in user input can't break the query |
+| Search | `test_search_reflects_edits` | The search index updates when a note is edited |
+| Paging | `test_cursor_pagination_walks_every_note_once` | Paging returns every note exactly once, newest first; a bad cursor gets `400` |
+| Delete | `test_delete_rules_and_soft_delete` | Only the author or an owner can delete; deleted notes disappear from reads and lists |
+| Validation | `test_validation_errors` | Empty titles, too many tags, and bad page sizes are rejected (`422`) |
+
+**Not covered yet:** load and concurrency testing under real parallel writers, and fuzzing of request bodies. Both are on the production list below.
+
+## Design decisions at a glance
+
+| Decision | Choice | Main reason | Trade-off accepted |
+|---|---|---|---|
+| Language / framework | Python + FastAPI | Typed validation and OpenAPI docs generated from the code | Slower raw throughput than Go; fine for a notes service |
+| Storage | SQLite (WAL) + FTS5 | Runs with one command; ACID; built-in search | One writer at a time; move to PostgreSQL for multi-instance scale |
+| Tenancy | Team in every URL and query | Isolation is the core requirement of a shared service | Cross-team sharing needs an explicit feature later |
+| Authorization | Roles: viewer, editor, owner | Simple, covers read/write/admin | No per-note permissions beyond `private` |
+| Concurrent edits | Version + ETag / If-Match | Prevents lost updates without locks | Clients must send `If-Match` and handle `412` |
+| Pagination | Keyset cursor | Fast at any depth; stable while notes are added | No "jump to page 7" |
+| Auth | Hashed API keys | Simple and secure for a deliverable | Production should use the company's SSO (OIDC) |
+| Delete | Soft delete | Work records should be recoverable | Rows accumulate; needs a purge policy |
+
+The reasoning behind each choice is in **Design choices, and why** above.
+
 ## Data model
 
 ```

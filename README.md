@@ -2,27 +2,29 @@
 
 A small REST service where multiple teams capture and share notes. A note belongs to a team. Who can read, write, or delete it depends on the caller's role in that team.
 
-- **Stack:** Python 3.12+, FastAPI, SQLite with full-text search (FTS5)
+- **Stack:** Python 3.12+, FastAPI, PostgreSQL 17 (psycopg 3, connection pool, built-in full-text search)
 - **Interactive API docs:** `http://localhost:8000/docs` (OpenAPI, generated from the code)
 - **Tests:** 15 end-to-end API tests (`pytest`), run in CI on every push
 
 ## Run it
 
+Everything in Docker (API + PostgreSQL):
+
 ```bash
+docker compose up --build              # API at http://localhost:8000/docs
+```
+
+Or run the API locally against the Dockerized database:
+
+```bash
+docker compose up -d db                # PostgreSQL on localhost:5433
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload          # http://localhost:8000/docs
-pytest -q                              # run the tests
+pytest -v                              # uses the separate notes_test database
 ```
 
-With Docker:
-
-```bash
-docker build -t notes .
-docker run -p 8000:8000 -v notes-data:/data notes
-```
-
-The database is a single file. Set `NOTES_DB` to choose its path (default `./notes.db`; `/data/notes.db` in Docker). The schema is created on startup.
+Configuration is one environment variable: `DATABASE_URL` (default `postgresql://notes:notes@localhost:5433/notes`). `DB_POOL_SIZE` sets the connection pool size (default 10). The schema is applied on startup. The database container also creates a separate `notes_test` database, so the tests never touch dev data.
 
 ## Try it
 
@@ -87,13 +89,17 @@ curl -s -X PATCH $B/teams/$TEAM/notes/<note_id> -H "$AUTH" -H 'If-Match: "1"' \
 
 **Keyset (cursor) pagination, not offset.** `?cursor=` encodes the last row's `(updated_at, id)`. Each page is an index range scan, cheap at any depth. New notes arriving between requests don't shift pages or cause duplicates, which offset pagination would.
 
-**Full-text search in the database (SQLite FTS5).** Search is what makes a notes service useful. FTS5 gives word search with no extra infrastructure, and triggers keep the index in sync with every insert, update, and delete. User input is quoted term by term, so characters like `"` or `NEAR` are searched as text and can't break the query.
+**PostgreSQL.** A service shared by many teams needs many concurrent writers, and PostgreSQL handles that with row-level locking. It also provides what this design leans on: native `uuid` and `timestamptz` types, `text[]` arrays for tags, partial indexes, `CHECK` constraints, and full-text search, all in one system. Connections come from a pool (psycopg 3 + psycopg-pool), so the app doesn't open a new connection per request. Several instances can run against one database: an advisory lock makes sure only one of them applies the schema at startup.
 
-**SQLite for this deliverable.** It's ACID, needs no server, starts instantly, and makes the service runnable with one command. WAL mode lets readers proceed while a write is in progress, and `busy_timeout` makes writers wait rather than fail. All SQL lives in `app/repo.py`, so moving to PostgreSQL is a driver and dialect change confined to one module (FTS5 becomes `tsvector` + GIN).
+**Full-text search inside PostgreSQL.** Search is what makes a notes service useful. A generated `tsvector` column (title weighted above body) is maintained by PostgreSQL itself, so it can never drift out of sync, and a GIN index makes it fast. Queries go through `websearch_to_tsquery`, which accepts any user text (phrases in quotes, `-exclusions`, `or`) and never raises a syntax error. English stemming means a search for "migration" also finds "migrations." There's no separate search cluster to run until scale demands one.
+
+**Tags as a `text[]` column with a GIN index.** Tags belong to the note, so they live on the note row. The array is read and written with the note in one statement, and `tags @> ARRAY['ops']` filtering uses the GIN index.
 
 **API keys, hashed.** Each user gets a 256-bit random key, and only its SHA-256 hash is stored. A fast hash is appropriate for high-entropy tokens; bcrypt and argon2 exist to slow down guessing of low-entropy human passwords. In a real shared service, identity would come from the company's SSO (OIDC / JWT), with API keys reserved for service-to-service calls. `current_user` is the only function that would change.
 
 **Soft delete.** `DELETE` sets `deleted_at` rather than destroying the row. Notes are work records, and an accidental delete should be recoverable. Every read filters deleted rows out, and the main list index is a partial index that excludes them.
+
+**Constraints in the database, not just the app.** Unique emails, valid roles, valid visibility, title length, and foreign keys are enforced by PostgreSQL as well as by the API. If two people register the same email at the same instant, the `UNIQUE` constraint decides, and the API turns the violation into a clean `409`.
 
 **Validation at the edge.** Pydantic models enforce limits before any business logic runs: title 1–200 characters, body ≤ 100 KB, ≤ 20 tags of ≤ 40 characters, page size 1–100. Tags are trimmed, lower-cased, and de-duplicated, so `Ops` and ` ops ` are the same tag.
 
@@ -106,7 +112,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-Fifteen end-to-end tests drive the real app over HTTP (FastAPI `TestClient`). Each test gets a fresh SQLite file, so tests are isolated and can run in any order. GitHub Actions runs the suite on every push (`.github/workflows/tests.yml`).
+Fifteen end-to-end tests drive the real app over HTTP (FastAPI `TestClient`) against a real PostgreSQL database, not a mock or SQLite stand-in, so the SQL that ships is the SQL that's tested. Every table is truncated before each test, so tests are isolated and can run in any order. Set `TEST_DATABASE_URL` to point them elsewhere (it must be a disposable database). GitHub Actions runs the suite on every push against a PostgreSQL 17 service container (`.github/workflows/tests.yml`).
 
 The tests are organized around the rules a shared service must not break:
 
@@ -122,7 +128,7 @@ The tests are organized around the rules a shared service must not break:
 | Privacy | `test_private_notes_are_author_only` | Private notes are hidden from teammates, in both reads and lists |
 | Privacy | `test_only_author_can_make_note_private` | Nobody can hide a teammate's note |
 | Concurrency | `test_update_requires_current_version` | Missing `If-Match` → `428`; a stale version → `412`; the newer edit survives |
-| Search | `test_search_and_tag_filter` | Full-text and tag filters return the right notes; FTS syntax in user input can't break the query |
+| Search | `test_search_and_tag_filter` | Full-text and tag filters return the right notes; search operators in user input can't break the query |
 | Search | `test_search_reflects_edits` | The search index updates when a note is edited |
 | Paging | `test_cursor_pagination_walks_every_note_once` | Paging returns every note exactly once, newest first; a bad cursor gets `400` |
 | Delete | `test_delete_rules_and_soft_delete` | Only the author or an owner can delete; deleted notes disappear from reads and lists |
@@ -135,7 +141,9 @@ The tests are organized around the rules a shared service must not break:
 | Decision | Choice | Main reason | Trade-off accepted |
 |---|---|---|---|
 | Language / framework | Python + FastAPI | Typed validation and OpenAPI docs generated from the code | Slower raw throughput than Go; fine for a notes service |
-| Storage | SQLite (WAL) + FTS5 | Runs with one command; ACID; built-in search | One writer at a time; move to PostgreSQL for multi-instance scale |
+| Storage | PostgreSQL 17 + built-in full-text search | Concurrent writers, strong constraints, search without extra infrastructure | One more service to run (handled by Docker Compose) |
+| Search | Generated `tsvector` + GIN, `websearch_to_tsquery` | Always in sync, fast, safe with any user input | English stemming only; dedicated search engine if needs grow |
+| Tags | `text[]` + GIN | Stored with the note; one-statement reads and writes | Renaming a tag across notes is a bulk update |
 | Tenancy | Team in every URL and query | Isolation is the core requirement of a shared service | Cross-team sharing needs an explicit feature later |
 | Authorization | Roles: viewer, editor, owner | Simple, covers read/write/admin | No per-note permissions beyond `private` |
 | Concurrent edits | Version + ETag / If-Match | Prevents lost updates without locks | Clients must send `If-Match` and handle `412` |
@@ -148,21 +156,23 @@ The reasoning behind each choice is in **Design choices, and why** above.
 ## Data model
 
 ```
-users(id, email UNIQUE, name, api_key_hash UNIQUE, created_at)
-teams(id, name, created_at)
-memberships(team_id, user_id, role)                      PK(team_id, user_id)
-notes(id, team_id, author_id, title, body, visibility, version,
-      created_at, updated_at, deleted_at)                 index(team_id, updated_at DESC, id DESC) WHERE deleted_at IS NULL
-note_tags(note_id, tag)                                  PK(note_id, tag), index(tag)
-notes_fts  -- FTS5 over notes(title, body), synced by triggers
+users(id uuid, email text UNIQUE, name, api_key_hash UNIQUE, created_at timestamptz)
+teams(id uuid, name, created_at)
+memberships(team_id, user_id, role CHECK in owner|editor|viewer)   PK(team_id, user_id), index(user_id)
+notes(id uuid, team_id, author_id, title CHECK 1..200, body, tags text[],
+      visibility CHECK in team|private, version, created_at, updated_at, deleted_at,
+      search tsvector GENERATED ALWAYS (title weight A, body weight B))
+  index (team_id, updated_at DESC, id DESC) WHERE deleted_at IS NULL   -- the list/paging path
+  GIN (search)                                                         -- full-text search
+  GIN (tags)                                                           -- tag filter
 ```
 
-IDs are UUIDv4, so they can't be guessed or enumerated, and they can be generated anywhere. Timestamps are UTC ISO-8601 with microseconds, which sort correctly as text.
+IDs are UUIDs generated by PostgreSQL (`gen_random_uuid()`), so they can't be guessed or enumerated. Timestamps are `timestamptz` (UTC).
 
 ## What I'd add for production
 
 1. **Identity:** OIDC/JWT from the corporate IdP; team membership synced from groups.
-2. **PostgreSQL** with migrations (Alembic), connection pooling, and row-level security as a second line of tenant isolation.
+2. **Database operations:** versioned migrations (Alembic) instead of startup DDL, row-level security as a second line of tenant isolation, a managed instance (for example Amazon RDS or Cloud SQL) with backups and a read replica.
 3. **Audit and history:** a `note_revisions` table (who changed what, when), which also enables restore.
 4. **Operations:** structured JSON logs with request IDs, OpenTelemetry traces, Prometheus metrics, and rate limiting per API key.
 5. **Features teams will ask for next:** attachments (object storage plus signed URLs), sharing a note across teams, and webhooks or events on note changes.
@@ -175,7 +185,9 @@ app/
   auth.py     bearer-token auth and role checks
   models.py   request/response schemas and validation
   repo.py     all SQL
-  db.py       connection settings and schema
+  db.py       connection pool and schema
 tests/
-  test_api.py end-to-end tests against a temporary database
+  test_api.py end-to-end tests against PostgreSQL
+docker-compose.yml   API + PostgreSQL 17 (plus a notes_test database)
+docker/initdb/       creates the test database on first start
 ```

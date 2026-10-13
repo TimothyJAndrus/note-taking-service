@@ -1,8 +1,9 @@
 """Authentication (who are you) and authorization (what may you do in this team)."""
 import hashlib
 import secrets
-import sqlite3
+from uuid import UUID
 
+import psycopg
 from fastapi import Depends, Header, HTTPException, status
 
 from app.db import get_conn
@@ -22,27 +23,27 @@ def hash_key(key: str) -> str:
 
 def current_user(
     authorization: str | None = Header(default=None),
-    conn: sqlite3.Connection = Depends(get_conn),
+    conn: psycopg.Connection = Depends(get_conn),
 ) -> dict:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing bearer token",
                             headers={"WWW-Authenticate": "Bearer"})
     token = authorization[7:].strip()
-    row = conn.execute("SELECT id, email, name, created_at FROM users WHERE api_key_hash = ?",
+    row = conn.execute("SELECT id, email, name, created_at FROM users WHERE api_key_hash = %s",
                        (hash_key(token),)).fetchone()
     if row is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token",
                             headers={"WWW-Authenticate": "Bearer"})
-    return dict(row)
+    return row
 
 
-def require_role(conn: sqlite3.Connection, team_id: str, user_id: str, minimum: str) -> str:
+def require_role(conn: psycopg.Connection, team_id: UUID, user_id: UUID, minimum: str) -> str:
     """Return the caller's role in the team, or raise.
 
     Non-members get 404, not 403, so the API never confirms that a team exists
     to someone outside it.
     """
-    row = conn.execute("SELECT role FROM memberships WHERE team_id = ? AND user_id = ?",
+    row = conn.execute("SELECT role FROM memberships WHERE team_id = %s AND user_id = %s",
                        (team_id, user_id)).fetchone()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Team not found")

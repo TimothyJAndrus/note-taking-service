@@ -1,98 +1,97 @@
-"""SQLite storage: connection handling and schema.
+"""PostgreSQL storage: connection pool and schema.
 
-One file, no server, ACID transactions, and built-in full-text search (FTS5).
-Every query goes through parameterized SQL in app/repo.py, so swapping to
-PostgreSQL later is a driver and dialect change, not a redesign.
+PostgreSQL gives us real concurrent writers, UUIDs, timestamptz, array columns
+for tags, and built-in full-text search (tsvector + GIN).
 """
 import os
-import sqlite3
 from collections.abc import Iterator
-from contextlib import closing
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+DEFAULT_URL = "postgresql://notes:notes@localhost:5433/notes"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    id            TEXT PRIMARY KEY,
-    email         TEXT NOT NULL UNIQUE,
-    name          TEXT NOT NULL,
-    api_key_hash  TEXT NOT NULL UNIQUE,
-    created_at    TEXT NOT NULL
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    email         text NOT NULL UNIQUE,              -- stored lower-cased
+    name          text NOT NULL,
+    api_key_hash  text NOT NULL UNIQUE,
+    created_at    timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS teams (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS memberships (
-    team_id  TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-    user_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role     TEXT NOT NULL CHECK (role IN ('owner', 'editor', 'viewer')),
+    team_id  uuid NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    user_id  uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role     text NOT NULL CHECK (role IN ('owner', 'editor', 'viewer')),
     PRIMARY KEY (team_id, user_id)
 );
-CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships(user_id);
+CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships (user_id);
 
 CREATE TABLE IF NOT EXISTS notes (
-    id          TEXT PRIMARY KEY,
-    team_id     TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-    author_id   TEXT NOT NULL REFERENCES users(id),
-    title       TEXT NOT NULL,
-    body        TEXT NOT NULL DEFAULT '',
-    visibility  TEXT NOT NULL DEFAULT 'team' CHECK (visibility IN ('team', 'private')),
-    version     INTEGER NOT NULL DEFAULT 1,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL,
-    deleted_at  TEXT
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    team_id     uuid NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    author_id   uuid NOT NULL REFERENCES users(id),
+    title       text NOT NULL CHECK (char_length(title) BETWEEN 1 AND 200),
+    body        text NOT NULL DEFAULT '',
+    tags        text[] NOT NULL DEFAULT '{}',
+    visibility  text NOT NULL DEFAULT 'team' CHECK (visibility IN ('team', 'private')),
+    version     integer NOT NULL DEFAULT 1,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    deleted_at  timestamptz,
+    -- Search vector maintained by PostgreSQL itself; titles weigh more than body text.
+    search      tsvector GENERATED ALWAYS AS (
+                    setweight(to_tsvector('english', title), 'A') ||
+                    setweight(to_tsvector('english', body), 'B')) STORED
 );
 CREATE INDEX IF NOT EXISTS idx_notes_team_updated
-    ON notes(team_id, updated_at DESC, id DESC) WHERE deleted_at IS NULL;
-
-CREATE TABLE IF NOT EXISTS note_tags (
-    note_id  TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-    tag      TEXT NOT NULL,
-    PRIMARY KEY (note_id, tag)
-);
-CREATE INDEX IF NOT EXISTS idx_note_tags_tag ON note_tags(tag);
-
--- Full-text index over title + body, kept in sync by triggers.
-CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts
-    USING fts5(title, body, content='notes', content_rowid='rowid');
-
-CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
-    INSERT INTO notes_fts(rowid, title, body) VALUES (new.rowid, new.title, new.body);
-END;
-CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
-    INSERT INTO notes_fts(notes_fts, rowid, title, body) VALUES ('delete', old.rowid, old.title, old.body);
-END;
-CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE OF title, body ON notes BEGIN
-    INSERT INTO notes_fts(notes_fts, rowid, title, body) VALUES ('delete', old.rowid, old.title, old.body);
-    INSERT INTO notes_fts(rowid, title, body) VALUES (new.rowid, new.title, new.body);
-END;
+    ON notes (team_id, updated_at DESC, id DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_notes_search ON notes USING gin (search);
+CREATE INDEX IF NOT EXISTS idx_notes_tags   ON notes USING gin (tags);
 """
 
-
-def db_path() -> str:
-    return os.environ.get("NOTES_DB", "notes.db")
+_pool: ConnectionPool | None = None
 
 
-def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path(), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")   # readers don't block the writer
-    conn.execute("PRAGMA busy_timeout = 5000")  # wait instead of failing under write contention
-    return conn
+def database_url() -> str:
+    return os.environ.get("DATABASE_URL", DEFAULT_URL)
 
 
-def init_db() -> None:
-    with closing(connect()) as conn:
-        conn.executescript(SCHEMA)
+def open_pool() -> None:
+    """Open the pool and apply the schema. Called once at startup."""
+    global _pool
+    pool = ConnectionPool(
+        database_url(),
+        min_size=1,
+        max_size=int(os.environ.get("DB_POOL_SIZE", "10")),
+        kwargs={"row_factory": dict_row, "autocommit": True},
+        open=True,
+    )
+    pool.wait(timeout=30)
+    with pool.connection() as conn, conn.transaction():
+        # Advisory lock: if several instances start at once, only one applies the schema.
+        conn.execute("SELECT pg_advisory_xact_lock(4242)")
+        conn.execute(SCHEMA)
+    _pool = pool
 
 
-def get_conn() -> Iterator[sqlite3.Connection]:
-    """FastAPI dependency: one connection per request, always closed."""
-    conn = connect()
-    try:
+def close_pool() -> None:
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+
+
+def get_conn() -> Iterator[psycopg.Connection]:
+    """FastAPI dependency: borrow a pooled connection for the request, then return it."""
+    assert _pool is not None, "database pool not open"
+    with _pool.connection() as conn:
         yield conn
-    finally:
-        conn.close()

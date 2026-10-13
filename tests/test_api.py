@@ -1,13 +1,24 @@
-"""End-to-end API tests: each test drives the real app against a fresh SQLite file."""
+"""End-to-end API tests: each test drives the real app against a real PostgreSQL database.
+
+Start the database first:  docker compose up -d db
+Override the target with TEST_DATABASE_URL (it must be a disposable database).
+"""
+import os
+
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
+TEST_DB = os.environ.get("TEST_DATABASE_URL", "postgresql://notes:notes@localhost:5433/notes_test")
+
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("NOTES_DB", str(tmp_path / "test.db"))
+def client(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", TEST_DB)
     from app.main import app
-    with TestClient(app) as c:  # runs startup, which creates the schema
+    with TestClient(app) as c:  # startup opens the pool and applies the schema
+        with psycopg.connect(TEST_DB, autocommit=True) as conn:  # every test starts empty
+            conn.execute("TRUNCATE notes, memberships, teams, users CASCADE")
         yield c
 
 

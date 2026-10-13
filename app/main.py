@@ -1,20 +1,23 @@
 """HTTP layer: routes, status codes, and access rules. SQL lives in app/repo.py."""
-import sqlite3
 from contextlib import asynccontextmanager
+from uuid import UUID
+
+import psycopg
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 
 from app import repo
 from app.auth import current_user, hash_key, new_api_key, require_role
-from app.db import get_conn, init_db
+from app.db import close_pool, get_conn, open_pool
 from app.models import (MemberAdd, MemberOut, NoteCreate, NoteOut, NotePage, NoteUpdate,
                         TeamCreate, TeamOut, UserCreate, UserCreated, UserOut)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    init_db()
+    open_pool()
     yield
+    close_pool()
 
 
 app = FastAPI(
@@ -26,7 +29,7 @@ app = FastAPI(
 )
 
 
-def _note_or_404(conn, team_id: str, note_id: str, user_id: str) -> dict:
+def _note_or_404(conn, team_id: UUID, note_id: UUID, user_id: str) -> dict:
     note = repo.get_note(conn, team_id, note_id, user_id)
     if note is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Note not found")
@@ -40,18 +43,19 @@ def _etag(note: dict) -> str:
 # ---- health & identity ------------------------------------------------------
 
 @app.get("/healthz", tags=["ops"])
-def healthz(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+def healthz(conn: psycopg.Connection = Depends(get_conn)) -> dict:
     conn.execute("SELECT 1").fetchone()
     return {"status": "ok"}
 
 
 @app.post("/users", response_model=UserCreated, status_code=201, tags=["users"],
           summary="Register a user and receive an API key (shown once)")
-def register(body: UserCreate, conn: sqlite3.Connection = Depends(get_conn)):
-    if repo.get_user_by_email(conn, body.email):
-        raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
+def register(body: UserCreate, conn: psycopg.Connection = Depends(get_conn)):
     key = new_api_key()
-    user = repo.create_user(conn, body.email, body.name, hash_key(key))
+    try:
+        user = repo.create_user(conn, body.email, body.name, hash_key(key))
+    except repo.DuplicateEmail:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
     return {**user, "api_key": key}
 
 
@@ -64,26 +68,26 @@ def me(user: dict = Depends(current_user)):
 
 @app.post("/teams", response_model=TeamOut, status_code=201, tags=["teams"])
 def create_team(body: TeamCreate, user: dict = Depends(current_user),
-                conn: sqlite3.Connection = Depends(get_conn)):
+                conn: psycopg.Connection = Depends(get_conn)):
     return repo.create_team(conn, body.name, user["id"])
 
 
 @app.get("/teams", response_model=list[TeamOut], tags=["teams"], summary="Teams I belong to")
-def list_teams(user: dict = Depends(current_user), conn: sqlite3.Connection = Depends(get_conn)):
+def list_teams(user: dict = Depends(current_user), conn: psycopg.Connection = Depends(get_conn)):
     return repo.list_teams(conn, user["id"])
 
 
 @app.get("/teams/{team_id}/members", response_model=list[MemberOut], tags=["teams"])
-def list_members(team_id: str, user: dict = Depends(current_user),
-                 conn: sqlite3.Connection = Depends(get_conn)):
+def list_members(team_id: UUID, user: dict = Depends(current_user),
+                 conn: psycopg.Connection = Depends(get_conn)):
     require_role(conn, team_id, user["id"], "viewer")
     return repo.list_members(conn, team_id)
 
 
 @app.put("/teams/{team_id}/members", response_model=list[MemberOut], tags=["teams"],
          summary="Add a member or change their role (owners only)")
-def put_member(team_id: str, body: MemberAdd, user: dict = Depends(current_user),
-               conn: sqlite3.Connection = Depends(get_conn)):
+def put_member(team_id: UUID, body: MemberAdd, user: dict = Depends(current_user),
+               conn: psycopg.Connection = Depends(get_conn)):
     require_role(conn, team_id, user["id"], "owner")
     target = repo.get_user_by_email(conn, body.email)
     if target is None:
@@ -97,8 +101,8 @@ def put_member(team_id: str, body: MemberAdd, user: dict = Depends(current_user)
 # ---- notes ------------------------------------------------------------------
 
 @app.post("/teams/{team_id}/notes", response_model=NoteOut, status_code=201, tags=["notes"])
-def create_note(team_id: str, body: NoteCreate, response: Response,
-                user: dict = Depends(current_user), conn: sqlite3.Connection = Depends(get_conn)):
+def create_note(team_id: UUID, body: NoteCreate, response: Response,
+                user: dict = Depends(current_user), conn: psycopg.Connection = Depends(get_conn)):
     require_role(conn, team_id, user["id"], "editor")
     note = repo.create_note(conn, team_id, user["id"], body.model_dump())
     response.headers["ETag"] = _etag(note)
@@ -108,25 +112,25 @@ def create_note(team_id: str, body: NoteCreate, response: Response,
 
 @app.get("/teams/{team_id}/notes", response_model=NotePage, tags=["notes"],
          summary="List or search notes, newest first")
-def list_notes(team_id: str,
+def list_notes(team_id: UUID,
                q: str | None = Query(default=None, max_length=200, description="Full-text search over title and body"),
                tag: str | None = Query(default=None, max_length=40),
-               author_id: str | None = None,
+               author_id: UUID | None = None,
                limit: int = Query(default=20, ge=1, le=100),
                cursor: str | None = None,
-               user: dict = Depends(current_user), conn: sqlite3.Connection = Depends(get_conn)):
+               user: dict = Depends(current_user), conn: psycopg.Connection = Depends(get_conn)):
     require_role(conn, team_id, user["id"], "viewer")
     try:
         items, next_cursor = repo.list_notes(conn, team_id, user["id"], q=q, tag=tag,
                                              author_id=author_id, limit=limit, cursor=cursor)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError):  # malformed base64, timestamp, or UUID
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid cursor")
     return {"items": items, "next_cursor": next_cursor}
 
 
 @app.get("/teams/{team_id}/notes/{note_id}", response_model=NoteOut, tags=["notes"])
-def get_note(team_id: str, note_id: str, response: Response,
-             user: dict = Depends(current_user), conn: sqlite3.Connection = Depends(get_conn)):
+def get_note(team_id: UUID, note_id: UUID, response: Response,
+             user: dict = Depends(current_user), conn: psycopg.Connection = Depends(get_conn)):
     require_role(conn, team_id, user["id"], "viewer")
     note = _note_or_404(conn, team_id, note_id, user["id"])
     response.headers["ETag"] = _etag(note)
@@ -135,9 +139,9 @@ def get_note(team_id: str, note_id: str, response: Response,
 
 @app.patch("/teams/{team_id}/notes/{note_id}", response_model=NoteOut, tags=["notes"],
            summary="Partially update a note. Requires If-Match with the current ETag.")
-def update_note(team_id: str, note_id: str, body: NoteUpdate, response: Response,
+def update_note(team_id: UUID, note_id: UUID, body: NoteUpdate, response: Response,
                 if_match: str | None = Header(default=None),
-                user: dict = Depends(current_user), conn: sqlite3.Connection = Depends(get_conn)):
+                user: dict = Depends(current_user), conn: psycopg.Connection = Depends(get_conn)):
     require_role(conn, team_id, user["id"], "editor")
     note = _note_or_404(conn, team_id, note_id, user["id"])
     if if_match is None:
@@ -160,8 +164,8 @@ def update_note(team_id: str, note_id: str, body: NoteUpdate, response: Response
 
 @app.delete("/teams/{team_id}/notes/{note_id}", status_code=204, tags=["notes"],
             summary="Soft-delete a note (author or team owner)")
-def delete_note(team_id: str, note_id: str,
-                user: dict = Depends(current_user), conn: sqlite3.Connection = Depends(get_conn)):
+def delete_note(team_id: UUID, note_id: UUID,
+                user: dict = Depends(current_user), conn: psycopg.Connection = Depends(get_conn)):
     role = require_role(conn, team_id, user["id"], "editor")
     note = _note_or_404(conn, team_id, note_id, user["id"])
     if note["author_id"] != user["id"] and role != "owner":

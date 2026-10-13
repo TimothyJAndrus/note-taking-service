@@ -1,5 +1,7 @@
 """Request and response schemas. Validation happens here, at the edge."""
+from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -24,10 +26,10 @@ class UserCreate(BaseModel):
 
 
 class UserOut(BaseModel):
-    id: str
+    id: UUID
     email: str
     name: str
-    created_at: str
+    created_at: datetime
 
 
 class UserCreated(UserOut):
@@ -39,10 +41,10 @@ class TeamCreate(BaseModel):
 
 
 class TeamOut(BaseModel):
-    id: str
+    id: UUID
     name: str
     role: Role
-    created_at: str
+    created_at: datetime
 
 
 class MemberAdd(BaseModel):
@@ -51,7 +53,7 @@ class MemberAdd(BaseModel):
 
 
 class MemberOut(BaseModel):
-    user_id: str
+    user_id: UUID
     email: str
     name: str
     role: Role
@@ -82,16 +84,16 @@ class NoteUpdate(BaseModel):
 
 
 class NoteOut(BaseModel):
-    id: str
-    team_id: str
-    author_id: str
+    id: UUID
+    team_id: UUID
+    author_id: UUID
     title: str
     body: str
     tags: list[str]
     visibility: Visibility
     version: int
-    created_at: str
-    updated_at: str
+    created_at: datetime
+    updated_at: datetime
 
 
 class NotePage(BaseModel):

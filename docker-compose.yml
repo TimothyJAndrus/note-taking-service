@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: notes
+      POSTGRES_PASSWORD: notes
+      POSTGRES_DB: notes
+    ports:
+      - "5433:5432"   # host 5433, to avoid clashing with a local Postgres on 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notes -d notes"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://notes:notes@db:5432/notes
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

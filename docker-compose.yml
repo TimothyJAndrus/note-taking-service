@@ -20,8 +20,19 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql://notes:notes@db:5432/notes
+      RUN_MIGRATIONS_ON_STARTUP: "false"   # the migrate service below does it, like the ECS one-off task
     ports:
       - "8000:8000"
+    read_only: true                        # same as production: nothing writes to the image
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    build: .
+    command: ["python", "-m", "app.migrate"]
+    environment:
+      DATABASE_URL: postgresql://notes:notes@db:5432/notes
     depends_on:
       db:
         condition: service_healthy

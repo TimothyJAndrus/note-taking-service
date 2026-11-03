@@ -1,5 +1,7 @@
-name: tests
+name: ci
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -22,3 +24,27 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
       - run: pytest -v
+      - name: Dependency audit (fails on any known vulnerability)
+        run: pip-audit -r requirements.txt
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t note-taking-service:ci .
+      - name: Container runs as non-root
+        run: test "$(docker run --rm --entrypoint id note-taking-service:ci -u)" = "10001"
+
+  infra:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx cdk synth --quiet

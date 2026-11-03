@@ -1,85 +1,48 @@
-"""PostgreSQL storage: connection pool and schema.
+"""PostgreSQL: connection pool and per-request identity for row-level security.
 
-PostgreSQL gives us real concurrent writers, UUIDs, timestamptz, array columns
-for tags, and built-in full-text search (tsvector + GIN).
+Every pooled connection runs as the restricted role notes_app (see migrations/0002), so
+PostgreSQL's row-level security applies. Each request records who is calling with
+set_actor(); the pool clears it when the connection is returned.
 """
-import os
 from collections.abc import Iterator
 
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-DEFAULT_URL = "postgresql://notes:notes@localhost:5433/notes"
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    email         text NOT NULL UNIQUE,              -- stored lower-cased
-    name          text NOT NULL,
-    api_key_hash  text NOT NULL UNIQUE,
-    created_at    timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS teams (
-    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    name        text NOT NULL,
-    created_at  timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS memberships (
-    team_id  uuid NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-    user_id  uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role     text NOT NULL CHECK (role IN ('owner', 'editor', 'viewer')),
-    PRIMARY KEY (team_id, user_id)
-);
-CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships (user_id);
-
-CREATE TABLE IF NOT EXISTS notes (
-    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    team_id     uuid NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-    author_id   uuid NOT NULL REFERENCES users(id),
-    title       text NOT NULL CHECK (char_length(title) BETWEEN 1 AND 200),
-    body        text NOT NULL DEFAULT '',
-    tags        text[] NOT NULL DEFAULT '{}',
-    visibility  text NOT NULL DEFAULT 'team' CHECK (visibility IN ('team', 'private')),
-    version     integer NOT NULL DEFAULT 1,
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now(),
-    deleted_at  timestamptz,
-    -- Search vector maintained by PostgreSQL itself; titles weigh more than body text.
-    search      tsvector GENERATED ALWAYS AS (
-                    setweight(to_tsvector('english', title), 'A') ||
-                    setweight(to_tsvector('english', body), 'B')) STORED
-);
-CREATE INDEX IF NOT EXISTS idx_notes_team_updated
-    ON notes (team_id, updated_at DESC, id DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_notes_search ON notes USING gin (search);
-CREATE INDEX IF NOT EXISTS idx_notes_tags   ON notes USING gin (tags);
-"""
+from app import config
+from app.migrate import migrate
 
 _pool: ConnectionPool | None = None
 
 
-def database_url() -> str:
-    return os.environ.get("DATABASE_URL", DEFAULT_URL)
+def _configure(conn: psycopg.Connection) -> None:
+    conn.execute("SET ROLE notes_app")
+
+
+def _reset(conn: psycopg.Connection) -> None:
+    conn.execute("SELECT set_config('app.user_id', '', false)")
+
+
+def set_actor(conn: psycopg.Connection, user_id) -> None:
+    """Tell PostgreSQL who this request is for (used by RLS policies and the audit trigger)."""
+    conn.execute("SELECT set_config('app.user_id', %s, false)", (str(user_id),))
 
 
 def open_pool() -> None:
-    """Open the pool and apply the schema. Called once at startup."""
     global _pool
+    if config.RUN_MIGRATIONS_ON_STARTUP:
+        migrate()
     pool = ConnectionPool(
-        database_url(),
+        config.database_url(),
         min_size=1,
-        max_size=int(os.environ.get("DB_POOL_SIZE", "10")),
+        max_size=config.DB_POOL_SIZE,
         kwargs={"row_factory": dict_row, "autocommit": True},
+        configure=_configure,
+        reset=_reset,
         open=True,
     )
     pool.wait(timeout=30)
-    with pool.connection() as conn, conn.transaction():
-        # Advisory lock: if several instances start at once, only one applies the schema.
-        conn.execute("SELECT pg_advisory_xact_lock(4242)")
-        conn.execute(SCHEMA)
     _pool = pool
 
 

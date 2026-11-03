@@ -130,4 +130,50 @@ def update_note(conn: psycopg.Connection, note_id: UUID, expected_version: int, 
 
 
 def soft_delete_note(conn: psycopg.Connection, note_id: UUID) -> None:
-    conn.execute("UPDATE notes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL", (note_id,))
+    # Bumps the version too, so the delete is its own entry in the revision history.
+    conn.execute("UPDATE notes SET deleted_at = now(), version = version + 1, updated_at = now() "
+                 "WHERE id = %s AND deleted_at IS NULL", (note_id,))
+
+
+# ---- revisions (written by the notes_revision trigger; read-only here) ----------------
+
+REVISION_COLS = "version, action, title, body, tags, visibility, changed_by, changed_at"
+
+
+def list_revisions(conn: psycopg.Connection, note_id: UUID) -> list[dict]:
+    return conn.execute(f"SELECT {REVISION_COLS} FROM note_revisions WHERE note_id = %s ORDER BY version DESC",
+                        (note_id,)).fetchall()
+
+
+def get_revision(conn: psycopg.Connection, note_id: UUID, version: int) -> dict | None:
+    return conn.execute(f"SELECT {REVISION_COLS} FROM note_revisions WHERE note_id = %s AND version = %s",
+                        (note_id, version)).fetchone()
+
+
+# ---- attachments ---------------------------------------------------------------------
+
+ATTACHMENT_COLS = "id, note_id, uploader_id, filename, content_type, size_bytes, status, created_at"
+
+
+def create_attachment(conn: psycopg.Connection, attachment_id: UUID, note_id: UUID, team_id: UUID,
+                      uploader_id: UUID, data: dict, s3_key: str) -> dict:
+    return conn.execute(
+        "INSERT INTO attachments (id, note_id, team_id, uploader_id, filename, content_type, size_bytes, s3_key) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING {ATTACHMENT_COLS}",
+        (attachment_id, note_id, team_id, uploader_id, data["filename"], data["content_type"],
+         data["size_bytes"], s3_key)).fetchone()
+
+
+def get_attachment(conn: psycopg.Connection, note_id: UUID, attachment_id: UUID) -> dict | None:
+    return conn.execute(f"SELECT {ATTACHMENT_COLS}, s3_key FROM attachments WHERE id = %s AND note_id = %s",
+                        (attachment_id, note_id)).fetchone()
+
+
+def mark_attachment_ready(conn: psycopg.Connection, attachment_id: UUID) -> dict:
+    return conn.execute(f"UPDATE attachments SET status = 'ready' WHERE id = %s RETURNING {ATTACHMENT_COLS}",
+                        (attachment_id,)).fetchone()
+
+
+def list_attachments(conn: psycopg.Connection, note_id: UUID) -> list[dict]:
+    return conn.execute(f"SELECT {ATTACHMENT_COLS} FROM attachments WHERE note_id = %s AND status = 'ready' "
+                        "ORDER BY created_at", (note_id,)).fetchall()

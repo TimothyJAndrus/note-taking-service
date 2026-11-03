@@ -99,3 +99,37 @@ class NoteOut(BaseModel):
 class NotePage(BaseModel):
     items: list[NoteOut]
     next_cursor: str | None = Field(description="Pass as ?cursor= to get the next page; null at the end.")
+
+
+class RevisionOut(BaseModel):
+    version: int
+    action: Literal["create", "update", "delete"]
+    title: str
+    body: str
+    tags: list[str]
+    visibility: Visibility
+    changed_by: UUID | None
+    changed_at: datetime
+
+
+class AttachmentCreate(BaseModel):
+    filename: str = Field(min_length=1, max_length=255, pattern=r"^[^/\\\x00-\x1f]+$")
+    content_type: str = Field(max_length=100, pattern=r"^[\w.+-]+/[\w.+-]+$")
+    size_bytes: int = Field(gt=0)
+
+
+class AttachmentOut(BaseModel):
+    id: UUID
+    note_id: UUID
+    uploader_id: UUID
+    filename: str
+    content_type: str
+    size_bytes: int
+    status: Literal["pending", "ready"]
+    created_at: datetime
+
+
+class AttachmentUpload(BaseModel):
+    attachment: AttachmentOut
+    upload: dict = Field(description="Presigned POST: send a multipart form to `url` with `fields` "
+                                     "plus the file as `file`. Then call .../complete.")

@@ -4,7 +4,8 @@ A small REST service where multiple teams capture and share notes. A note belong
 
 - **Stack:** Python 3.12+, FastAPI, PostgreSQL 17 (psycopg 3, connection pool, built-in full-text search)
 - **Interactive API docs:** `http://localhost:8000/docs` (OpenAPI, generated from the code)
-- **Tests:** 15 end-to-end API tests (`pytest`), run in CI on every push
+- **Tests:** 30 end-to-end tests (`pytest`) against real PostgreSQL, plus a dependency audit, an image build, and `cdk synth`, all in CI on every push
+- **Deploy:** AWS CDK app in [`infra/`](infra/README.md): ECS Fargate behind an ALB with WAF, RDS PostgreSQL 17, S3 for attachments
 
 ## Run it
 
@@ -24,7 +25,21 @@ uvicorn app.main:app --reload          # http://localhost:8000/docs
 pytest -v                              # uses the separate notes_test database
 ```
 
-Configuration is one environment variable: `DATABASE_URL` (default `postgresql://notes:notes@localhost:5433/notes`). `DB_POOL_SIZE` sets the connection pool size (default 10). The schema is applied on startup. The database container also creates a separate `notes_test` database, so the tests never touch dev data.
+Configuration is environment variables only (`app/config.py`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` or `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER`/`DB_PASSWORD`/`DB_SSLMODE` | local compose DB | Connection. The `DB_*` form is how ECS injects Secrets Manager fields. |
+| `RUN_MIGRATIONS_ON_STARTUP` | `true` | Local convenience. `false` in AWS, where migrations run as a one-off task. |
+| `AUTH_MODE` | `api_key` | `api_key`, `oidc`, or `both` |
+| `OIDC_ISSUER` / `OIDC_AUDIENCE` / `OIDC_JWKS_URL` | empty | Corporate IdP settings for JWT verification |
+| `ALLOW_API_KEY_SIGNUP` | `true` | Turn off self-registration when everyone signs in with SSO |
+| `RATE_LIMIT_PER_MINUTE` | `120` | Per-credential limit per instance; `0` disables |
+| `ATTACHMENTS_BUCKET` / `ATTACHMENT_MAX_BYTES` | empty / 25 MB | S3 bucket for attachments (endpoints return 503 when unset) |
+| `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `json` | Structured logs |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Turns on OpenTelemetry tracing (e.g. an ADOT collector sidecar) |
+
+Migrations: `python -m app.migrate` applies the numbered SQL files in `migrations/` once each, in order, under an advisory lock. `docker compose up` runs them as a separate `migrate` service before the API starts, the same way production does. The database container also creates a separate `notes_test` database, so the tests never touch dev data.
 
 ## Try it
 
@@ -57,7 +72,9 @@ curl -s -X PATCH $B/teams/$TEAM/notes/<note_id> -H "$AUTH" -H 'If-Match: "1"' \
 
 | Method | Path | Who | What |
 |---|---|---|---|
-| GET | `/healthz` | anyone | Liveness plus a database check |
+| GET | `/healthz` | anyone | Liveness (process up; no dependencies) |
+| GET | `/readyz` | anyone | Readiness (database reachable); the load balancer's health check |
+| GET | `/metrics` | internal | Prometheus metrics (blocked at the public load balancer) |
 | POST | `/users` | anyone | Register; returns an API key once |
 | GET | `/me` | any user | Who am I |
 | POST | `/teams` | any user | Create a team; the caller becomes owner |
@@ -69,6 +86,12 @@ curl -s -X PATCH $B/teams/$TEAM/notes/<note_id> -H "$AUTH" -H 'If-Match: "1"' \
 | GET | `/teams/{team_id}/notes/{id}` | viewer+ | Read one note (returns `ETag`) |
 | PATCH | `/teams/{team_id}/notes/{id}` | editor+ | Partial update; requires `If-Match` |
 | DELETE | `/teams/{team_id}/notes/{id}` | author or owner | Soft delete |
+| GET | `/teams/{team_id}/notes/{id}/revisions` | viewer+ | Every version: who changed what, when |
+| POST | `/teams/{team_id}/notes/{id}/revisions/{version}/restore` | editor+ | Restore a version as a new one; requires `If-Match` |
+| POST | `/teams/{team_id}/notes/{id}/attachments` | editor+ | Start an upload; returns a presigned S3 POST |
+| POST | `/teams/{team_id}/notes/{id}/attachments/{aid}/complete` | editor+ | Confirm the upload (server checks the object and size) |
+| GET | `/teams/{team_id}/notes/{id}/attachments` | viewer+ | List uploaded attachments |
+| GET | `/teams/{team_id}/notes/{id}/attachments/{aid}/download` | viewer+ | 307 to a 5-minute presigned download link |
 
 **Roles:** `viewer` reads. `editor` also creates and edits team notes. `owner` also manages members and can delete any note. A `private` note is visible only to its author, even inside the team, and only the author can make a note private.
 
@@ -76,10 +99,13 @@ curl -s -X PATCH $B/teams/$TEAM/notes/<note_id> -H "$AUTH" -H 'If-Match: "1"' \
 - `401`: missing or bad token
 - `404`: you aren't a member, so the team appears not to exist
 - `403`: you're a member, but your role doesn't allow the action
-- `409`: duplicate email
+- `409`: duplicate email; SSO email already owned by an API-key account; upload missing or wrong size
 - `412`: someone else changed the note since you read it
 - `428`: `If-Match` is missing
 - `422`: validation failed
+- `413`: attachment over the size limit
+- `429`: rate limit exceeded (with `Retry-After`)
+- `503`: attachments not configured
 
 ## Design choices, and why
 
@@ -148,7 +174,7 @@ The tests are organized around the rules a shared service must not break:
 | Authorization | Roles: viewer, editor, owner | Simple, covers read/write/admin | No per-note permissions beyond `private` |
 | Concurrent edits | Version + ETag / If-Match | Prevents lost updates without locks | Clients must send `If-Match` and handle `412` |
 | Pagination | Keyset cursor | Fast at any depth; stable while notes are added | No "jump to page 7" |
-| Auth | Hashed API keys | Simple and secure for a deliverable | Production should use the company's SSO (OIDC) |
+| Auth | OIDC/JWT from the IdP, plus hashed API keys for service accounts | SSO for people, keys for automation | Group-to-team sync not built yet |
 | Delete | Soft delete | Work records should be recoverable | Rows accumulate; needs a purge policy |
 
 The reasoning behind each choice is in **Design choices, and why** above.
@@ -169,25 +195,39 @@ notes(id uuid, team_id, author_id, title CHECK 1..200, body, tags text[],
 
 IDs are UUIDs generated by PostgreSQL (`gen_random_uuid()`), so they can't be guessed or enumerated. Timestamps are `timestamptz` (UTC).
 
-## What I'd add for production
+## Production readiness
 
-1. **Identity:** OIDC/JWT from the corporate IdP; team membership synced from groups.
-2. **Database operations:** versioned migrations (Alembic) instead of startup DDL, row-level security as a second line of tenant isolation, a managed instance (for example Amazon RDS or Cloud SQL) with backups and a read replica.
-3. **Audit and history:** a `note_revisions` table (who changed what, when), which also enables restore.
-4. **Operations:** structured JSON logs with request IDs, OpenTelemetry traces, Prometheus metrics, and rate limiting per API key.
-5. **Features teams will ask for next:** attachments (object storage plus signed URLs), sharing a note across teams, and webhooks or events on note changes.
+Version 1 ended with a list of what production would need. Version 2 builds it:
+
+| Need | What's built | Where | Proven by |
+|---|---|---|---|
+| **Identity** | OIDC/JWT from the corporate IdP (signature via JWKS, issuer, audience, expiry). Users are provisioned on first sign-in. An IdP email never silently takes over an existing API-key account. API keys remain for service accounts; self-signup can be turned off. | `app/auth.py` | `test_oidc_*` (valid, wrong audience, expired, forged signature, takeover attempt) |
+| **Database operations** | Versioned SQL migrations run as a separate step. **Row-level security**: the app runs as a restricted role (`notes_app`), so PostgreSQL itself hides other teams' rows even if a query forgets its team filter. Managed RDS with backups, Multi-AZ, and forced TLS in `infra/`. | `migrations/`, `app/migrate.py`, `app/db.py` | `test_rls_hides_other_teams_rows...` (fails if RLS is disabled; checked), `test_migrations_recorded_and_idempotent` |
+| **Audit and history** | A trigger writes every version of every note (create, update, delete) with the authenticated user. `GET .../revisions` shows the history; `POST .../revisions/{v}/restore` brings back an earlier version as a new one (If-Match required). | `migrations/0002_production.sql`, `app/main.py` | `test_every_change_is_a_revision...`, `test_restore_an_earlier_version` |
+| **Operations** | JSON logs with a request ID on every line and response (`X-Request-ID`, accepted from upstream). Prometheus metrics at `/metrics` by route template. Liveness `/healthz` vs readiness `/readyz`. Per-credential rate limiting (429 + `Retry-After`) plus a WAF rate rule per IP at the edge. Optional OpenTelemetry traces (SQL text only, never parameters). | `app/observability.py` | `test_request_ids_and_metrics`, `test_rate_limit_middleware_returns_429`, `test_liveness_and_readiness` |
+| **Attachments** | S3 with presigned POST uploads; S3 enforces the declared size and type. The server confirms the object exists before listing it. Object keys never contain user filenames. Downloads are 5-minute presigned links forced to `Content-Disposition: attachment`. | `app/storage.py` | `test_attachment_*` (S3 mocked with moto) |
+| **Supply chain** | Pinned dependencies with `pip-audit` in CI (FastAPI/Starlette upgraded to clear 14 known Starlette advisories). Multi-stage image running as a fixed non-root UID with a read-only root filesystem. | `requirements.txt`, `Dockerfile` | CI `test` + `image` jobs |
+
+**Still not done** (honest list): syncing team membership from IdP groups; sharing a note across teams; webhooks/events on note changes; malware scanning of uploads; load testing under parallel writers; a shared (cross-instance) per-credential rate limit, since today that is per instance plus WAF per IP.
 
 ## Project layout
 
 ```
 app/
-  main.py     routes, status codes, access rules
-  auth.py     bearer-token auth and role checks
-  models.py   request/response schemas and validation
-  repo.py     all SQL
-  db.py       connection pool and schema
+  main.py           routes, status codes, access rules
+  auth.py           API-key and OIDC auth, role checks
+  models.py         request/response schemas and validation
+  repo.py           all SQL
+  db.py             connection pool, restricted role, per-request identity
+  migrate.py        versioned SQL migrations (python -m app.migrate)
+  observability.py  JSON logs, request IDs, metrics, rate limiting, tracing
+  storage.py        S3 presigned uploads/downloads
+  config.py         every environment variable in one place
+migrations/         numbered .sql files
 tests/
-  test_api.py end-to-end tests against PostgreSQL
-docker-compose.yml   API + PostgreSQL 17 (plus a notes_test database)
+  test_api.py         core API behavior against PostgreSQL
+  test_production.py  RLS, history, OIDC, attachments, rate limits, metrics
+infra/              AWS CDK app (see infra/README.md)
+docker-compose.yml  API + migrate step + PostgreSQL 17 (plus a notes_test database)
 docker/initdb/       creates the test database on first start
 ```

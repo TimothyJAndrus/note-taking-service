@@ -35,6 +35,24 @@ jobs:
       - name: Container runs as non-root
         run: test "$(docker run --rm --entrypoint id note-taking-service:ci -u)" = "10001"
 
+  gate-stack:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: guardrails
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: python -m venv .venv && .venv/bin/pip install -r requirements.txt
+      - run: npm ci --prefix ../infra
+      - name: cdk synth (policy is validated at synth; no AWS credentials needed)
+        run: ../infra/node_modules/.bin/cdk synth --quiet -c account=123456789012 -c approverEmails=ci@example.com
+
   infra:
     runs-on: ubuntu-latest
     defaults:

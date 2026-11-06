@@ -1,0 +1,62 @@
+# Action policy for agents using the notes MCP server (app/mcp_server.py).
+# Checked by agent-guardrails before every tool call. Default deny: a tool that
+# isn't named here can't run. The notes API's own rules (team membership, roles,
+# private notes, row-level security) still apply after the gate allows a call;
+# the gate decides what an AGENT may do, on top of what its user may do.
+version: 1
+default: deny
+
+approval:
+  expires_in: 3600              # a pending approval lapses after an hour
+  approvers:
+    emails: []                  # set at deploy: -c approverEmails=a@x.com,b@y.com (dashboard approvers)
+    slack_user_ids: []
+
+limits:
+  max_calls_per_run: 200        # one run = one MCP session for one user; runaway-loop backstop
+
+rules:
+  - id: read-teams
+    tool: list_teams
+    effect: allow
+    description: an agent may list its user's teams
+
+  - id: read-notes
+    tool: search_notes
+    effect: allow
+    max_per_run: 100
+    when:
+      query: {max_length: 200}
+    description: search is read-only; the API returns only notes the user can read
+
+  - id: read-note
+    tool: read_note
+    effect: allow
+    max_per_run: 100
+    description: reading one note the user can already read
+
+  - id: ask-notes
+    tool: ask
+    effect: allow
+    max_per_run: 30
+    when:
+      question: {max_length: 1000}
+    description: answers cost model tokens, so they're capped per session
+
+  - id: private-notes-allowed
+    tool: create_note
+    effect: allow
+    max_per_run: 10
+    when:
+      visibility: {equals: private}
+      body: {max_length: 20000}
+    description: a private note is visible only to its author, so the agent may write one
+
+  - id: team-notes-need-approval
+    tool: create_note
+    effect: approve
+    max_per_run: 5
+    when:
+      visibility: {equals: team}
+      body: {max_length: 20000}
+    description: a note the whole team will see needs a human first

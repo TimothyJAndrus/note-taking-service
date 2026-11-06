@@ -35,7 +35,7 @@ def _user_id(client, headers):
 def test_migrations_recorded_and_idempotent(client):
     with psycopg.connect(TEST_DB) as conn:
         done = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
-    assert done[:2] == ["0001_initial", "0002_production"]
+    assert done[:3] == ["0001_initial", "0002_production", "0003_ask"]
     assert migrate(TEST_DB) == []  # second run applies nothing
 
 

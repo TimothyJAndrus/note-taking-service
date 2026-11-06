@@ -30,6 +30,9 @@ TypeScript CDK app (`aws-cdk-lib` 2.27x, cdk-nag `AwsSolutionsChecks`) that depl
 | `authMode` | `both` | Only used when `oidcIssuer` is set |
 | `corsOrigin` | `*` | Restrict this to your web origin |
 | `alarmEmail` | empty | Creates an SNS topic + email subscription (confirm the email) |
+| `aiMode` | `off` | `bedrock` turns on `POST /teams/{id}/ask` and grants the task role `bedrock:InvokeModel` on the two models below only. Enable model access in the Bedrock console first. After the first deploy with it on, backfill existing notes once: run the migrate task with command `python -m app.reindex`. |
+| `embedModelId` | `amazon.titan-embed-text-v2:0` | Must produce 1024-dim vectors (`migrations/0003_ask.sql`) |
+| `chatModelId` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Any Converse-capable model or inference profile |
 
 ## Deploy
 

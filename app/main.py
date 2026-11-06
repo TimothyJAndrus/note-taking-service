@@ -5,13 +5,14 @@ from uuid import UUID
 
 import psycopg
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.responses import RedirectResponse
 
-from app import config, repo, storage
+from app import ai, ask, config, repo, storage
 from app.auth import current_user, hash_key, new_api_key, require_role
 from app.db import close_pool, get_conn, open_pool
-from app.models import (AttachmentCreate, AttachmentOut, AttachmentUpload, MemberAdd, MemberOut,
+from app.models import (AskRequest, AskResponse, AttachmentCreate, AttachmentOut, AttachmentUpload, MemberAdd,
+                        MemberOut,
                         NoteCreate, NoteOut, NotePage, NoteUpdate, RevisionOut, TeamCreate, TeamOut,
                         UserCreate, UserCreated, UserOut)
 from app.observability import (RequestContextMiddleware, TokenBucket, metrics_endpoint, setup_logging,
@@ -37,6 +38,7 @@ app = FastAPI(
 app.add_middleware(RequestContextMiddleware,
                    limiter=TokenBucket(config.RATE_LIMIT_PER_MINUTE) if config.RATE_LIMIT_PER_MINUTE > 0 else None)
 setup_tracing(app)
+_ask_limiter = TokenBucket(config.ASK_RATE_PER_MINUTE) if config.ASK_RATE_PER_MINUTE > 0 else None
 
 
 def _note_or_404(conn, team_id: UUID, note_id: UUID, user_id: str) -> dict:
@@ -123,10 +125,11 @@ def put_member(team_id: UUID, body: MemberAdd, user: dict = Depends(current_user
 # ---- notes ------------------------------------------------------------------
 
 @app.post("/teams/{team_id}/notes", response_model=NoteOut, status_code=201, tags=["notes"])
-def create_note(team_id: UUID, body: NoteCreate, response: Response,
+def create_note(team_id: UUID, body: NoteCreate, response: Response, background: BackgroundTasks,
                 user: dict = Depends(current_user), conn: psycopg.Connection = Depends(get_conn)):
     require_role(conn, team_id, user["id"], "editor")
     note = repo.create_note(conn, team_id, user["id"], body.model_dump())
+    background.add_task(ask.index_after_write, team_id, note["id"], user["id"])
     response.headers["ETag"] = _etag(note)
     response.headers["Location"] = f"/teams/{team_id}/notes/{note['id']}"
     return note
@@ -161,7 +164,7 @@ def get_note(team_id: UUID, note_id: UUID, response: Response,
 
 @app.patch("/teams/{team_id}/notes/{note_id}", response_model=NoteOut, tags=["notes"],
            summary="Partially update a note. Requires If-Match with the current ETag.")
-def update_note(team_id: UUID, note_id: UUID, body: NoteUpdate, response: Response,
+def update_note(team_id: UUID, note_id: UUID, body: NoteUpdate, response: Response, background: BackgroundTasks,
                 if_match: str | None = Header(default=None),
                 user: dict = Depends(current_user), conn: psycopg.Connection = Depends(get_conn)):
     require_role(conn, team_id, user["id"], "editor")
@@ -179,6 +182,7 @@ def update_note(team_id: UUID, note_id: UUID, body: NoteUpdate, response: Respon
     if not repo.update_note(conn, note_id, expected, changes):
         raise HTTPException(status.HTTP_412_PRECONDITION_FAILED,
                             "Note changed since you read it; GET it again and retry")
+    background.add_task(ask.index_after_write, team_id, note_id, user["id"])
     note = _note_or_404(conn, team_id, note_id, user["id"])
     response.headers["ETag"] = _etag(note)
     return note
@@ -210,7 +214,7 @@ def list_revisions(team_id: UUID, note_id: UUID,
 @app.post("/teams/{team_id}/notes/{note_id}/revisions/{version}/restore", response_model=NoteOut,
           tags=["history"], summary="Restore an earlier version (creates a new version). Requires If-Match.")
 def restore_revision(team_id: UUID, note_id: UUID, version: int, response: Response,
-                     if_match: str | None = Header(default=None),
+                     background: BackgroundTasks, if_match: str | None = Header(default=None),
                      user: dict = Depends(current_user), conn: psycopg.Connection = Depends(get_conn)):
     require_role(conn, team_id, user["id"], "editor")
     note = _note_or_404(conn, team_id, note_id, user["id"])
@@ -228,6 +232,7 @@ def restore_revision(team_id: UUID, note_id: UUID, version: int, response: Respo
     changes = {k: rev[k] for k in ("title", "body", "tags", "visibility")}
     if not repo.update_note(conn, note_id, expected, changes):
         raise HTTPException(status.HTTP_412_PRECONDITION_FAILED, "Note changed since you read it")
+    background.add_task(ask.index_after_write, team_id, note_id, user["id"])
     note = _note_or_404(conn, team_id, note_id, user["id"])
     response.headers["ETag"] = _etag(note)
     return note
@@ -294,3 +299,27 @@ def download_attachment(team_id: UUID, note_id: UUID, attachment_id: UUID,
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Attachment not found")
     return RedirectResponse(storage.presign_download(att["s3_key"], att["filename"], att["content_type"]),
                             status_code=307)
+
+
+# ---- ask (AI answers grounded in the team's notes) ------------------------------------
+
+@app.post("/teams/{team_id}/ask", response_model=AskResponse, tags=["ask"],
+          summary="Answer a question from this team's notes, citing note id and version")
+def ask_team(team_id: UUID, body: AskRequest, response: Response,
+             user: dict = Depends(current_user), conn: psycopg.Connection = Depends(get_conn)):
+    """Retrieval runs as the caller (row-level security plus the private-note rule), so an answer
+    can only draw on, and cite, notes the caller could already read. Any viewer may ask."""
+    if config.AI_MODE == "off":
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Ask is not enabled on this service")
+    require_role(conn, team_id, user["id"], "viewer")
+    if _ask_limiter and (wait := _ask_limiter.take(f"ask:{user['id']}")):
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Ask rate limit exceeded",
+                            headers={"Retry-After": str(max(1, round(wait)))})
+    try:
+        out = ask.answer(conn, team_id, user["id"], body.question, body.top_k)
+    except ai.ModelUnavailable:
+        ask.ASKS.labels("model_error").inc()
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "The answer model is unavailable; try again",
+                            headers={"Retry-After": "5"})
+    response.headers["Cache-Control"] = "no-store"
+    return out

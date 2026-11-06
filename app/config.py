@@ -38,5 +38,15 @@ ATTACHMENTS_BUCKET = os.environ.get("ATTACHMENTS_BUCKET", "")
 ATTACHMENT_MAX_BYTES = int(os.environ.get("ATTACHMENT_MAX_BYTES", str(25 * 1024 * 1024)))
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 
+# AI: /teams/{id}/ask. "bedrock" (real models), "fake" (offline, deterministic; tests), or "off".
+AI_MODE = os.environ.get("AI_MODE", "off").lower()
+EMBED_MODEL_ID = os.environ.get("EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0")
+CHAT_MODEL_ID = os.environ.get("CHAT_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+AI_TIMEOUT_SECONDS = int(os.environ.get("AI_TIMEOUT_SECONDS", "30"))
+ASK_TOP_K = int(os.environ.get("ASK_TOP_K", "8"))                    # chunks sent to the model
+ASK_MAX_OUTPUT_TOKENS = int(os.environ.get("ASK_MAX_OUTPUT_TOKENS", "600"))
+ASK_RATE_PER_MINUTE = int(os.environ.get("ASK_RATE_PER_MINUTE", "10"))  # per user; model calls cost money
+ASK_CATCHUP_LIMIT = int(os.environ.get("ASK_CATCHUP_LIMIT", "20"))  # unindexed notes indexed inline per ask
+
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT = os.environ.get("LOG_FORMAT", "json")  # "json" or "text"

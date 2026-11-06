@@ -177,3 +177,81 @@ def mark_attachment_ready(conn: psycopg.Connection, attachment_id: UUID) -> dict
 def list_attachments(conn: psycopg.Connection, note_id: UUID) -> list[dict]:
     return conn.execute(f"SELECT {ATTACHMENT_COLS} FROM attachments WHERE note_id = %s AND status = 'ready' "
                         "ORDER BY created_at", (note_id,)).fetchall()
+
+
+# ---- retrieval index for /ask (note_chunks) -------------------------------------------
+# A chunk is only "live" while its version equals the note's current version and the note
+# isn't deleted. Every read below joins on that, so stale chunks are invisible even before
+# they're cleaned up.
+
+def notes_needing_index(conn: psycopg.Connection, team_id: UUID | None, limit: int) -> list[dict]:
+    """Live notes whose current version has no chunks yet. team_id=None means every team (CLI)."""
+    where = "n.deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM note_chunks c " \
+            "WHERE c.note_id = n.id AND c.version = n.version)"
+    args: list = []
+    if team_id is not None:
+        where = "n.team_id = %s AND " + where
+        args.append(team_id)
+    return conn.execute(f"SELECT n.id, n.team_id, n.title, n.body, n.version FROM notes n WHERE {where} "
+                        "ORDER BY n.updated_at DESC LIMIT %s", [*args, limit]).fetchall()
+
+
+def count_notes_needing_index(conn: psycopg.Connection, team_id: UUID) -> int:
+    return conn.execute(
+        "SELECT count(*) AS n FROM notes n WHERE n.team_id = %s AND n.deleted_at IS NULL AND NOT EXISTS "
+        "(SELECT 1 FROM note_chunks c WHERE c.note_id = n.id AND c.version = n.version)",
+        (team_id,)).fetchone()["n"]
+
+
+def replace_chunks(conn: psycopg.Connection, note: dict, chunks: list[tuple[str, str]], model: str) -> bool:
+    """Store chunks [(content, pgvector literal)] for note['version'], dropping older versions' chunks.
+
+    Returns False (and writes nothing) if the note moved on to a newer version meanwhile,
+    so a slow indexer can never overwrite fresh chunks with stale ones.
+    """
+    with conn.transaction():
+        current = conn.execute("SELECT version FROM notes WHERE id = %s AND deleted_at IS NULL FOR UPDATE",
+                               (note["id"],)).fetchone()
+        if current is None or current["version"] != note["version"]:
+            return False
+        conn.execute("DELETE FROM note_chunks WHERE note_id = %s", (note["id"],))
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO note_chunks (note_id, team_id, version, chunk_index, title, content, embedding, model) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s::vector, %s)",
+                [(note["id"], note["team_id"], note["version"], i, note["title"], content, vec, model)
+                 for i, (content, vec) in enumerate(chunks)])
+    return True
+
+
+def search_chunks(conn: psycopg.Connection, team_id: UUID, viewer_id: UUID, *, query: str,
+                  query_vec: str, k: int, candidates: int = 40) -> list[dict]:
+    """Hybrid retrieval: vector similarity and full-text rank, fused with reciprocal rank fusion.
+
+    Only chunks the viewer may read: their team (also enforced by RLS), live notes,
+    current versions, and private notes only for their author.
+    """
+    eligible = ("FROM note_chunks c JOIN notes n ON n.id = c.note_id AND n.version = c.version "
+                "WHERE c.team_id = %(team)s AND n.team_id = %(team)s AND n.deleted_at IS NULL "
+                "AND (n.visibility = 'team' OR n.author_id = %(viewer)s)")
+    sql = f"""
+        WITH vec AS (
+            SELECT c.id, row_number() OVER (ORDER BY c.embedding <=> %(v)s::vector) AS r
+            {eligible}
+            ORDER BY c.embedding <=> %(v)s::vector LIMIT %(cand)s),
+        fts AS (
+            SELECT c.id, row_number() OVER (ORDER BY ts_rank_cd(c.search, websearch_to_tsquery('english', %(q)s))
+                                            DESC) AS r
+            {eligible} AND c.search @@ websearch_to_tsquery('english', %(q)s)
+            ORDER BY ts_rank_cd(c.search, websearch_to_tsquery('english', %(q)s)) DESC LIMIT %(cand)s),
+        fused AS (
+            SELECT id, sum(1.0 / (60 + r)) AS score FROM (SELECT * FROM vec UNION ALL SELECT * FROM fts) u
+            GROUP BY id)
+        SELECT c.note_id, c.version, c.chunk_index, c.title, c.content, f.score
+        FROM fused f JOIN note_chunks c ON c.id = f.id
+        ORDER BY f.score DESC, c.note_id, c.chunk_index LIMIT %(k)s"""
+    with conn.transaction():
+        # pgvector >= 0.8: keep scanning the HNSW graph until enough rows pass the filters.
+        conn.execute("SET LOCAL hnsw.iterative_scan = 'relaxed_order'")
+        return conn.execute(sql, {"team": team_id, "viewer": viewer_id, "v": query_vec, "q": query,
+                                  "cand": candidates, "k": k}).fetchall()

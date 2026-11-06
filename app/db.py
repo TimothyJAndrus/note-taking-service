@@ -5,6 +5,7 @@ PostgreSQL's row-level security applies. Each request records who is calling wit
 set_actor(); the pool clears it when the connection is returned.
 """
 from collections.abc import Iterator
+from contextlib import contextmanager
 
 import psycopg
 from psycopg.rows import dict_row
@@ -55,6 +56,14 @@ def close_pool() -> None:
 
 def get_conn() -> Iterator[psycopg.Connection]:
     """FastAPI dependency: borrow a pooled connection for the request, then return it."""
+    assert _pool is not None, "database pool not open"
+    with _pool.connection() as conn:
+        yield conn
+
+
+@contextmanager
+def pool_connection() -> Iterator[psycopg.Connection]:
+    """A pooled connection outside a request (background tasks). Same role, same reset."""
     assert _pool is not None, "database pool not open"
     with _pool.connection() as conn:
         yield conn

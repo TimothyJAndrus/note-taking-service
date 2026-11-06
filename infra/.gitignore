@@ -4,3 +4,4 @@ cdk-outputs.json
 *.js
 *.d.ts
 !jest.config.js
+cdk.context.json   # holds the AWS account ID; this repo is public

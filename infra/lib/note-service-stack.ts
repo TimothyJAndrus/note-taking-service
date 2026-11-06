@@ -8,6 +8,7 @@ import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import * as cw from 'aws-cdk-lib/aws-cloudwatch';
@@ -41,6 +42,10 @@ export class NoteServiceStack extends cdk.Stack {
     const domainName = ctx('domainName');
     const alarmEmail = ctx('alarmEmail');
     const httpsEnabled = Boolean(certificateArn && domainName);
+    // /ask: 'bedrock' turns on AI answers (Titan embeddings + Claude via Bedrock); 'off' by default.
+    const aiMode = ctx('aiMode', 'off');
+    const embedModelId = ctx('embedModelId', 'amazon.titan-embed-text-v2:0');
+    const chatModelId = ctx('chatModelId', 'us.anthropic.claude-haiku-4-5-20251001-v1:0');
 
     // -------------------------------------------------------------------- VPC
     const vpc = new ec2.Vpc(this, 'Vpc', {
@@ -247,6 +252,9 @@ export class NoteServiceStack extends cdk.Stack {
         ATTACHMENTS_BUCKET: attachments.bucketName,
         RATE_LIMIT_PER_MINUTE: '120',
         RUN_MIGRATIONS_ON_STARTUP: 'false',
+        AI_MODE: aiMode,
+        EMBED_MODEL_ID: embedModelId,
+        CHAT_MODEL_ID: chatModelId,
       },
       secrets: dbSecrets,
       healthCheck: {
@@ -265,6 +273,24 @@ export class NoteServiceStack extends cdk.Stack {
     });
     container.addMountPoints({ containerPath: '/tmp', sourceVolume: 'tmp', readOnly: false });
     attachments.grantReadWrite(taskDef.taskRole);
+    if (aiMode === 'bedrock') {
+      // Only the two configured models. A cross-region inference profile ('us.' prefix) needs the
+      // profile ARN plus the foundation-model ARN in each region the profile can route to.
+      const fm = (id: string) => `arn:${this.partition}:bedrock:*::foundation-model/${id}`;
+      const chatIsProfile = /^(us|eu|apac|global)\./.test(chatModelId);
+      const chatBase = chatIsProfile ? chatModelId.replace(/^[a-z]+\./, '') : chatModelId;
+      taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+        sid: 'AskInvokeModels',
+        actions: ['bedrock:InvokeModel'],
+        resources: [
+          fm(embedModelId),
+          fm(chatBase),
+          ...(chatIsProfile
+            ? [`arn:${this.partition}:bedrock:${this.region}:${this.account}:inference-profile/${chatModelId}`]
+            : []),
+        ],
+      }));
+    }
 
     // Init container: every task applies pending migrations before the app starts. Safe to run
     // from many tasks at once (advisory lock; each file applied exactly once), so the very first
@@ -634,6 +660,12 @@ export class NoteServiceStack extends cdk.Stack {
             'Action::s3:List*',
             { regex: '/^Resource::<AttachmentsBucket.*\\.Arn>/\\*$/g' },
           ],
+        },
+        {
+          id: 'AwsSolutions-IAM5',
+          reason: 'Bedrock foundation-model ARNs have no account and a cross-region inference profile can route to '
+            + 'any region in its geography, so the region is a wildcard; actions and model IDs are pinned.',
+          appliesTo: [{ regex: '/^Resource::arn:<AWS::Partition>:bedrock:\\*::foundation-model\\/.*$/g' }],
         },
       ],
       true,

@@ -4,7 +4,8 @@ A small REST service where multiple teams capture and share notes. A note belong
 
 - **Stack:** Python 3.12+, FastAPI, PostgreSQL 17 (psycopg 3, connection pool, built-in full-text search)
 - **Interactive API docs:** `http://localhost:8000/docs` (OpenAPI, generated from the code)
-- **Tests:** 30 end-to-end tests (`pytest`) against real PostgreSQL, plus a dependency audit, an image build, and `cdk synth`, all in CI on every push
+- **Tests:** 47 end-to-end tests (`pytest`) against real PostgreSQL + pgvector, plus a dependency audit, an image build, and `cdk synth`, all in CI on every push
+- **Ask:** `POST /teams/{id}/ask` answers questions from a team's notes, citing note id and version, and can only use notes the caller can read. An MCP server exposes search, read, create and ask to agents under the caller's own identity.
 - **Deploy:** AWS CDK app in [`infra/`](infra/README.md): ECS Fargate behind an ALB with WAF, RDS PostgreSQL 17, S3 for attachments
 
 ## Run it
@@ -38,6 +39,9 @@ Configuration is environment variables only (`app/config.py`):
 | `ATTACHMENTS_BUCKET` / `ATTACHMENT_MAX_BYTES` | empty / 25 MB | S3 bucket for attachments (endpoints return 503 when unset) |
 | `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `json` | Structured logs |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Turns on OpenTelemetry tracing (e.g. an ADOT collector sidecar) |
+| `AI_MODE` | `off` | `bedrock` turns on `/ask`; `fake` is an offline stand-in for tests and local dev |
+| `EMBED_MODEL_ID` / `CHAT_MODEL_ID` | Titan Text Embeddings v2 / Claude Haiku 4.5 (`us.` profile) | Bedrock models for `/ask` |
+| `ASK_TOP_K` / `ASK_MAX_OUTPUT_TOKENS` / `ASK_RATE_PER_MINUTE` | `8` / `600` / `10` | Chunks given to the model, answer length cap, per-user ask limit |
 
 Migrations: `python -m app.migrate` applies the numbered SQL files in `migrations/` once each, in order, under an advisory lock. `docker compose up` runs them as a separate `migrate` service before the API starts, the same way production does. The database container also creates a separate `notes_test` database, so the tests never touch dev data.
 
@@ -92,6 +96,7 @@ curl -s -X PATCH $B/teams/$TEAM/notes/<note_id> -H "$AUTH" -H 'If-Match: "1"' \
 | POST | `/teams/{team_id}/notes/{id}/attachments/{aid}/complete` | editor+ | Confirm the upload (server checks the object and size) |
 | GET | `/teams/{team_id}/notes/{id}/attachments` | viewer+ | List uploaded attachments |
 | GET | `/teams/{team_id}/notes/{id}/attachments/{aid}/download` | viewer+ | 307 to a 5-minute presigned download link |
+| POST | `/teams/{team_id}/ask` | viewer+ | Answer a question from notes you can read, with citations (`note_id`, `version`) |
 
 **Roles:** `viewer` reads. `editor` also creates and edits team notes. `owner` also manages members and can delete any note. A `private` note is visible only to its author, even inside the team, and only the author can make a note private.
 
@@ -105,7 +110,7 @@ curl -s -X PATCH $B/teams/$TEAM/notes/<note_id> -H "$AUTH" -H 'If-Match: "1"' \
 - `422`: validation failed
 - `413`: attachment over the size limit
 - `429`: rate limit exceeded (with `Retry-After`)
-- `503`: attachments not configured
+- `503`: attachments not configured, `/ask` not enabled, or the model is unavailable (with `Retry-After`)
 
 ## Design choices, and why
 
@@ -131,6 +136,48 @@ curl -s -X PATCH $B/teams/$TEAM/notes/<note_id> -H "$AUTH" -H 'If-Match: "1"' \
 
 **Layering.** `models.py` (shapes) → `main.py` (HTTP and access rules) → `repo.py` (SQL) → `db.py` (connection and schema). Each layer is small enough to read in one sitting.
 
+## Ask: answers from your notes, with citations
+
+```bash
+curl -s -X POST $B/teams/$TEAM/ask -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"question":"What do we run before the rollout?"}'
+# {"answer": "Run database migrations as the one-off ECS task before the rollout. [S1]",
+#  "citations": [{"source":"S1","note_id":"…","version":3,"title":"Deploy checklist","snippet":"…"}],
+#  "grounded": true, "index": {"pending": 0, "indexed_now": 0}, "usage": {…}}
+```
+
+**Permission-aware retrieval.** Retrieval runs on the caller's own request connection, so the same two walls that protect `GET /notes` protect every chunk the model sees: row-level security on `team_id` (PostgreSQL itself) and the private-note rule. The model can only draw on, and cite, notes the caller could already open. A non-member gets `404`, the same as for any other team URL.
+
+**Hybrid search.** Each note version is split into chunks (`note_chunks`); each chunk has a Titan v2 embedding (pgvector, HNSW index) and its own `tsvector`. Vector and full-text results are merged with reciprocal rank fusion, so exact terms (an error code, a name) and paraphrases both find the right note.
+
+**Citations you can check.** The model sees numbered sources and must cite them as `[S1]`. The server keeps only citations that point at a retrieved source, strips invented ones, and returns each with the note id and the version the text came from. `grounded` is true only if at least one real citation survived. If nothing readable matches, the model isn't called at all.
+
+**Never stale.** A chunk records the note version it was cut from, and retrieval joins on the note's *current* version. Text from before an edit, a restore or a delete can't be retrieved or cited, even before re-indexing finishes. A slow indexer can't overwrite newer chunks either (it re-checks the version under a row lock).
+
+**Indexing never blocks writes.** Creates, updates and restores schedule indexing after the response is sent. If Bedrock is down, the write still succeeds; the next `/ask` indexes whatever is missing (`index.pending` reports how many notes aren't searchable yet). `python -m app.reindex` backfills everything, for example after first enabling the feature.
+
+**Notes are data, not instructions.** Note text goes to the model inside source tags with an instruction to treat it as text. The eval below includes a note that tries to override the rules.
+
+**Measured, not assumed.** `evals/ask_eval.py` seeds a team and a rival team and scores 13 cases with deterministic rules: facts, multi-note answers, conflicting notes, a prompt-injection note, questions the notes can't answer, a private note asked about by a teammate and by its author, a cross-team question, and an outsider. Any leak fails the run. Claude Haiku 4.5 via Bedrock: **39/39** (13 cases × 3 runs), no leaks, ~19.7k input / ~1k output tokens for the whole run.
+
+```bash
+AWS_PROFILE=<profile> AI_MODE=bedrock python -m evals.ask_eval --repeat 3
+```
+
+### MCP server
+
+`app/mcp_server.py` gives agents five tools: `list_teams`, `search_notes`, `read_note`, `create_note`, `ask`. It has no database access: every tool calls this API with the **caller's own token**, so an agent can't see or do more than the person it acts for (roles, private notes, RLS, rate limits and the revision history all apply). Read tools are annotated read-only.
+
+```bash
+# Local, for a desktop client (Claude Desktop, Cursor, Hermes):
+NOTES_API_URL=https://notes.example.com NOTES_API_TOKEN=<api key or IdP JWT> python -m app.mcp_server
+
+# Shared, over streamable HTTP: each request's own Authorization header is forwarded.
+NOTES_API_URL=https://notes.example.com python -m app.mcp_server --http --port 8001
+```
+
+In HTTP mode a request without a bearer token is refused; the server never falls back to a token from its own environment.
+
 ## Tests
 
 ```bash
@@ -138,7 +185,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-Fifteen end-to-end tests drive the real app over HTTP (FastAPI `TestClient`) against a real PostgreSQL database, not a mock or SQLite stand-in, so the SQL that ships is the SQL that's tested. Every table is truncated before each test, so tests are isolated and can run in any order. Set `TEST_DATABASE_URL` to point them elsewhere (it must be a disposable database). GitHub Actions runs the suite on every push against a PostgreSQL 17 service container (`.github/workflows/tests.yml`).
+End-to-end tests drive the real app over HTTP (FastAPI `TestClient`) against a real PostgreSQL database, not a mock or SQLite stand-in, so the SQL that ships is the SQL that's tested. Every table is truncated before each test, so tests are isolated and can run in any order. Set `TEST_DATABASE_URL` to point them elsewhere (it must be a disposable database). GitHub Actions runs the suite on every push against a PostgreSQL 17 + pgvector service container (`.github/workflows/tests.yml`). `/ask` tests run with `AI_MODE=fake` (deterministic, offline), so CI needs no AWS credentials; model quality is measured by the live eval instead.
 
 The tests are organized around the rules a shared service must not break:
 
@@ -159,6 +206,8 @@ The tests are organized around the rules a shared service must not break:
 | Paging | `test_cursor_pagination_walks_every_note_once` | Paging returns every note exactly once, newest first; a bad cursor gets `400` |
 | Delete | `test_delete_rules_and_soft_delete` | Only the author or an owner can delete; deleted notes disappear from reads and lists |
 | Validation | `test_validation_errors` | Empty titles, too many tags, and bad page sizes are rejected (`422`) |
+| Ask | `tests/test_ask.py` (14) | Citations carry note id + version; outsiders get `404`; another team's notes never appear; RLS alone blocks chunks; private notes inform only their author; edits and deletes are never cited stale; stale indexers can't overwrite; invented citations are stripped; a model outage never breaks writes; rate limit, disabled mode, chunking |
+| MCP | `tests/test_mcp.py` (3) | Tools act as the caller; API roles apply to agents; HTTP never falls back to the server's token |
 
 **Not covered yet:** load and concurrency testing under real parallel writers, and fuzzing of request bodies. Both are on the production list below.
 
@@ -191,6 +240,9 @@ notes(id uuid, team_id, author_id, title CHECK 1..200, body, tags text[],
   index (team_id, updated_at DESC, id DESC) WHERE deleted_at IS NULL   -- the list/paging path
   GIN (search)                                                         -- full-text search
   GIN (tags)                                                           -- tag filter
+note_chunks(note_id, team_id, version, chunk_index, title, content, embedding vector(1024), model,
+            search tsvector GENERATED)                                 -- /ask retrieval; RLS on team_id
+  HNSW (embedding vector_cosine_ops), GIN (search), (note_id, version)
 ```
 
 IDs are UUIDs generated by PostgreSQL (`gen_random_uuid()`), so they can't be guessed or enumerated. Timestamps are `timestamptz` (UTC).
@@ -222,12 +274,19 @@ app/
   migrate.py        versioned SQL migrations (python -m app.migrate)
   observability.py  JSON logs, request IDs, metrics, rate limiting, tracing
   storage.py        S3 presigned uploads/downloads
+  ai.py             Bedrock embeddings + answers (and an offline fake), chunking
+  ask.py            /ask: indexing, permission-aware retrieval, citation checks
+  reindex.py        backfill the retrieval index (python -m app.reindex)
+  mcp_server.py     MCP server: search/read/create/ask as the caller
   config.py         every environment variable in one place
 migrations/         numbered .sql files
 tests/
   test_api.py         core API behavior against PostgreSQL
   test_production.py  RLS, history, OIDC, attachments, rate limits, metrics
+  test_ask.py         /ask retrieval, isolation, citations, staleness
+  test_mcp.py         MCP tools under the caller's identity
+evals/              live /ask eval (cases + deterministic scorer)
 infra/              AWS CDK app (see infra/README.md)
-docker-compose.yml  API + migrate step + PostgreSQL 17 (plus a notes_test database)
+docker-compose.yml  API + migrate step + PostgreSQL 17 with pgvector (plus a notes_test database)
 docker/initdb/       creates the test database on first start
 ```

@@ -133,3 +133,30 @@ class AttachmentUpload(BaseModel):
     attachment: AttachmentOut
     upload: dict = Field(description="Presigned POST: send a multipart form to `url` with `fields` "
                                      "plus the file as `file`. Then call .../complete.")
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=1000)
+    top_k: int = Field(default=8, ge=1, le=20, description="How many note chunks to give the model")
+
+
+class Citation(BaseModel):
+    source: str = Field(description="The [S#] marker used in the answer text")
+    note_id: UUID
+    version: int = Field(description="The note version the cited text came from")
+    chunk: int
+    title: str
+    snippet: str
+
+
+class AskIndexStatus(BaseModel):
+    pending: int = Field(description="Notes in this team not yet searchable by /ask")
+    indexed_now: int = Field(description="Notes indexed while answering this question")
+
+
+class AskResponse(BaseModel):
+    answer: str
+    citations: list[Citation]
+    grounded: bool = Field(description="True only if the answer cites at least one note you can read")
+    index: AskIndexStatus
+    usage: dict

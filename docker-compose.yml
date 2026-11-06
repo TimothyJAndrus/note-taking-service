@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:pg17   # PostgreSQL 17 + pgvector (RDS for PostgreSQL 17 includes it too)
     environment:
       POSTGRES_USER: notes
       POSTGRES_PASSWORD: notes

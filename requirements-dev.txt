@@ -3,3 +3,6 @@ pytest==9.1.1
 httpx==0.28.1
 moto[s3]==5.2.5
 pip-audit==2.10.0
+# Action gate for the MCP server (optional at runtime: only with GUARDRAILS_MODE=local|remote)
+agent-guardrails @ https://github.com/TimothyJAndrus/agent-guardrails/archive/eb5a85edbd22451d8185db486c66ce83927be22d.tar.gz
+pyyaml==6.0.3

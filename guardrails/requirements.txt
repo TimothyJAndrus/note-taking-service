@@ -1,0 +1,2 @@
+# The gate stack (CDK, Python). The gate itself is agent-guardrails' ActionGate construct.
+agent-guardrails[cdk] @ https://github.com/TimothyJAndrus/agent-guardrails/archive/eb5a85edbd22451d8185db486c66ce83927be22d.tar.gz

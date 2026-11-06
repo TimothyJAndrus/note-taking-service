@@ -4,8 +4,8 @@ A small REST service where multiple teams capture and share notes. A note belong
 
 - **Stack:** Python 3.12+, FastAPI, PostgreSQL 17 (psycopg 3, connection pool, built-in full-text search)
 - **Interactive API docs:** `http://localhost:8000/docs` (OpenAPI, generated from the code)
-- **Tests:** 47 end-to-end tests (`pytest`) against real PostgreSQL + pgvector, plus a dependency audit, an image build, and `cdk synth`, all in CI on every push
-- **Ask:** `POST /teams/{id}/ask` answers questions from a team's notes, citing note id and version, and can only use notes the caller can read. An MCP server exposes search, read, create and ask to agents under the caller's own identity.
+- **Tests:** 59 end-to-end tests (`pytest`) against real PostgreSQL + pgvector, plus a dependency audit, an image build, and `cdk synth`, all in CI on every push
+- **Ask:** `POST /teams/{id}/ask` answers questions from a team's notes, citing note id and version, and can only use notes the caller can read. An MCP server exposes search, read, create and ask to agents under the caller's own identity, behind an [agent-guardrails](https://github.com/TimothyJAndrus/agent-guardrails) action gate (policy, human approval, audit).
 - **Deploy:** AWS CDK app in [`infra/`](infra/README.md): ECS Fargate behind an ALB with WAF, RDS PostgreSQL 17, S3 for attachments
 
 ## Run it
@@ -178,6 +178,34 @@ NOTES_API_URL=https://notes.example.com python -m app.mcp_server --http --port 8
 
 In HTTP mode a request without a bearer token is refused; the server never falls back to a token from its own environment.
 
+### Action gate (agent-guardrails)
+
+The API limits an agent to what its **user** may do. [agent-guardrails](https://github.com/TimothyJAndrus/agent-guardrails) adds the other half: what the **agent** may do, and who approved it. With `GUARDRAILS_MODE=local` or `remote`, every MCP tool call is checked against [`guardrails/policy.yaml`](guardrails/policy.yaml) *before* it reaches the API:
+
+| Tool | Decision |
+|---|---|
+| `list_teams`, `search_notes`, `read_note`, `ask` | allowed (capped per session) |
+| `create_note` with `visibility: private` | allowed, up to 10 per session |
+| `create_note` with `visibility: team` | **held for a human**; the agent gets `pending_approval` and a `call_id`; the note doesn't exist yet |
+| anything else | denied (default deny) |
+
+A human approves or rejects on the gate's dashboard (or Slack/email). The agent then calls `run_approved(call_id)`, which writes exactly the arguments the human saw, once, and only for the user it was requested for. Every call, decision and result is in the gate's hash-chained audit trail, replayable per session.
+
+- **Fails closed.** If the gate is unreachable, the tool doesn't run.
+- **Two walls.** A gate "allow" doesn't skip the API's checks: an outsider is still refused by the API.
+- **Who it's for.** Each call carries `acting_for` (the user's email and id), so approvers see whose session it came from, and a different user can't run an approved call even with its id.
+
+```bash
+# Dev: in-process gate, policy from the file
+GUARDRAILS_MODE=local NOTES_API_TOKEN=... python -m app.mcp_server
+
+# Production: the deployed gate. Deploy it once (CDK, uses agent-guardrails' ActionGate construct):
+cd guardrails && python -m venv .venv && .venv/bin/pip install -r requirements.txt
+npx cdk deploy -c approverEmails=you@example.com -c mcpTrustRoleArn=<role the MCP server runs as>
+# then run the MCP server as McpAgentRoleArn with:
+GUARDRAILS_MODE=remote GUARDRAILS_API_URL=<GateApiUrlForMcp> python -m app.mcp_server --http
+```
+
 ## Tests
 
 ```bash
@@ -208,6 +236,7 @@ The tests are organized around the rules a shared service must not break:
 | Validation | `test_validation_errors` | Empty titles, too many tags, and bad page sizes are rejected (`422`) |
 | Ask | `tests/test_ask.py` (14) | Citations carry note id + version; outsiders get `404`; another team's notes never appear; RLS alone blocks chunks; private notes inform only their author; edits and deletes are never cited stale; stale indexers can't overwrite; invented citations are stripped; a model outage never breaks writes; rate limit, disabled mode, chunking |
 | MCP | `tests/test_mcp.py` (3) | Tools act as the caller; API roles apply to agents; HTTP never falls back to the server's token |
+| Gate | `tests/test_gate.py` (12) | Reads allowed and audited; team notes held, then run once after approval; rejected calls never run; another user can't run an approved call (checked twice); default deny and per-session caps; API checks still apply; gate down = tool doesn't run; bad tokens never reach the gate |
 
 **Not covered yet:** load and concurrency testing under real parallel writers, and fuzzing of request bodies. Both are on the production list below.
 
@@ -278,6 +307,7 @@ app/
   ask.py            /ask: indexing, permission-aware retrieval, citation checks
   reindex.py        backfill the retrieval index (python -m app.reindex)
   mcp_server.py     MCP server: search/read/create/ask as the caller
+  gate.py           agent-guardrails action gate for MCP tool calls
   config.py         every environment variable in one place
 migrations/         numbered .sql files
 tests/
@@ -286,6 +316,7 @@ tests/
   test_ask.py         /ask retrieval, isolation, citations, staleness
   test_mcp.py         MCP tools under the caller's identity
 evals/              live /ask eval (cases + deterministic scorer)
+guardrails/         action-gate policy for agents + CDK stack (NotesMcpGate)
 infra/              AWS CDK app (see infra/README.md)
 docker-compose.yml  API + migrate step + PostgreSQL 17 with pgvector (plus a notes_test database)
 docker/initdb/       creates the test database on first start

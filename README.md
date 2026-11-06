@@ -8,6 +8,15 @@ A small REST service where multiple teams capture and share notes. A note belong
 - **Ask:** `POST /teams/{id}/ask` answers questions from a team's notes, citing note id and version, and can only use notes the caller can read. An MCP server exposes search, read, create and ask to agents under the caller's own identity, behind an [agent-guardrails](https://github.com/TimothyJAndrus/agent-guardrails) action gate (policy, human approval, audit).
 - **Deploy:** AWS CDK app in [`infra/`](infra/README.md): ECS Fargate behind an ALB with WAF, RDS PostgreSQL 17, S3 for attachments
 
+Part of the **trusted-agent stack**, four small open-source pieces for running AI agents a company can trust:
+
+| | Question it answers |
+|---|---|
+| [agent-credential-broker](https://github.com/TimothyJAndrus/agent-credential-broker) | What can the agent **access**? Short-lived, scoped credentials. |
+| [agent-guardrails](https://github.com/TimothyJAndrus/agent-guardrails) | What can the agent **do**, and who approved it? Policy and human approval on every tool call. |
+| [agent-trap-evals](https://github.com/TimothyJAndrus/agent-trap-evals) | Is the agent's output **true**? Traps a shallow check passes and a deeper check fails. |
+| **note-taking-service** | A real app using them: cited Q&A over team notes, and an MCP server behind the gate. |
+
 ## Run it
 
 Everything in Docker (API + PostgreSQL):
